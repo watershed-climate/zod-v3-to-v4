@@ -1,131 +1,104 @@
 #!/usr/bin/env node
 
-import {
-  cancel,
-  confirm,
-  intro,
-  isCancel,
-  log,
-  outro,
-  progress,
-  text,
-} from "@clack/prompts";
-import { exec } from "node:child_process";
 import * as fs from "node:fs";
-import { promisify } from "node:util";
-import { Project } from "ts-morph";
+import * as path from "node:path";
+import { Project, SourceFile } from "ts-morph";
 import { migrateZodV3ToV4 } from "./migrate.ts";
 
-const execAsync = promisify(exec);
-
-intro(`🏗️  Let's migrate Zod from v3 to v4`);
-
-// Check if an argument was provided after calling the script
-// Ex: npx zod-v3-to-v4 path/to/your/tsconfig.json
+// Get file path from CLI argument
+// Ex: npx zod-v3-to-v4 path/to/your/file.ts
 const args = process.argv.slice(2);
-const tsConfigFilePathParam = args[0];
-if (tsConfigFilePathParam) {
-  const isValid = validateTsConfigPath(tsConfigFilePathParam);
-  if (isValid.success) {
-    // If everything is valid, run the migration without question
-    await runMigration(tsConfigFilePathParam);
-    process.exit(0);
-  }
+const filePath = args[0];
 
-  log.warn(
-    `"${tsConfigFilePathParam}" is not a valid tsconfig file. ${isValid.reason}
-
-Let's do it interactively!`,
-  );
+if (!filePath) {
+  console.error("Error: No file path provided.");
+  console.error("Usage: zod-v3-to-v4 <path-to-file>");
+  process.exit(1);
 }
 
-// Check if the git working directory is clean
-const { stdout } = await execAsync("git status --porcelain");
-const isGitDirty = stdout.trim().length > 0;
-if (isGitDirty) {
-  const shouldContinue = await confirm({
-    message: "Your git working directory is dirty. Continue?",
+const isValid = validateFilePath(filePath);
+if (!isValid.success) {
+  console.error(`Error: "${filePath}" is not a valid TypeScript file. ${isValid.reason}`);
+  process.exit(1);
+}
+
+await runMigration(filePath);
+
+function findClosestTsConfig(startDir: string): string | null {
+  let currentDir = path.resolve(startDir);
+  while (true) {
+    const tsConfigPath = path.join(currentDir, "tsconfig.json");
+    if (fs.existsSync(tsConfigPath)) {
+      return tsConfigPath;
+    }
+    const parentDir = path.dirname(currentDir);
+    if (parentDir === currentDir) {
+      // Reached the root directory
+      return null;
+    }
+    currentDir = parentDir;
+  }
+}
+
+async function runMigration(filePath: string) {
+  const absoluteFilePath = path.resolve(filePath);
+  const fileDir = path.dirname(absoluteFilePath);
+
+  // Find the closest tsconfig.json
+  const tsConfigFilePath = findClosestTsConfig(fileDir);
+  if (!tsConfigFilePath) {
+    console.error("Error: No tsconfig.json found. Please ensure there's a tsconfig.json in the project.");
+    process.exit(1);
+  }
+
+  console.log(`Found tsconfig.json at: ${tsConfigFilePath}`);
+  console.log(`Processing file: ${absoluteFilePath}`);
+
+  // Initialize ts-morph Project with the found tsconfig.json
+  // Use skipFileDependencyResolution to prevent auto-loading files
+  const project = new Project({
+    tsConfigFilePath,
+    skipFileDependencyResolution: true,
   });
-  if (!shouldContinue || isCancel(shouldContinue)) {
-    cancel("Migration cancelled.");
-    process.exit(0);
-  }
-}
 
-// Ask the user for the tsconfig file path
-const tsConfigFilePath = await text({
-  message: "Where is your tsconfig.json?",
-  placeholder: `path/to/your/tsconfig.json`,
-  initialValue: tsConfigFilePathParam ?? "tsconfig.json",
-  validate(value) {
-    if (!value) {
-      return "Please enter a file path";
+  // Remove any files that were auto-loaded
+  project.getSourceFiles().forEach((file: SourceFile) => {
+    project.removeSourceFile(file);
+  });
+
+  // Add only the specific file to the project
+  const sourceFile = project.addSourceFileAtPath(absoluteFilePath);
+
+  try {
+    migrateZodV3ToV4(sourceFile, { migrateImportDeclarations: true });
+  } catch (err) {
+    let message = `Failed to migrate ${sourceFile.getFilePath()}`;
+    if (err instanceof Error) {
+      message += `\nReason: ${err.message}`;
     }
-
-    const isValid = validateTsConfigPath(value);
-    if (!isValid.success) {
-      return isValid.reason;
-    }
-  },
-});
-if (isCancel(tsConfigFilePath)) {
-  cancel("Migration cancelled.");
-  process.exit(0);
-}
-
-await runMigration(tsConfigFilePath);
-
-async function runMigration(tsConfigFilePath: string) {
-  const project = new Project({ tsConfigFilePath });
-  const filesToProcess = project.getSourceFiles();
-
-  let processedFilesCount = 0;
-  const progressBar = progress({ max: filesToProcess.length });
-  progressBar.start("Processing files...");
-
-  for (const sourceFile of filesToProcess) {
-    try {
-      migrateZodV3ToV4(sourceFile);
-    } catch (err) {
-      let message = `Failed to migrate ${sourceFile.getFilePath()}`;
-      if (err instanceof Error) {
-        message += `\nReason: ${err.message}`;
-      }
-      message += `\n\nPlease report this at https://github.com/nicoespeon/zod-v3-to-v4/issues`;
-      log.error(message);
-    }
-
-    processedFilesCount++;
-    progressBar.advance(
-      1,
-      `Migrated ${processedFilesCount}/${filesToProcess.length} files`,
-    );
-
-    // Wait the next tick to let the progress bar update
-    await wait(0);
+    message += `\n\nPlease report this at https://github.com/nicoespeon/zod-v3-to-v4/issues`;
+    console.error(message);
+    process.exit(1);
   }
 
-  // Only save at the end so we can cancel the migration in-flight.
-  // Also, it's much faster than saving each file individually.
+  // Save the changes
   await project.save();
 
-  progressBar.stop("All files have been migrated.");
-  outro(
-    `You're all set!
-
-ℹ️  If the migration missed something or did something wrong, please report it at https://github.com/nicoespeon/zod-v3-to-v4/issues`,
-  );
+  console.log("File has been migrated successfully.");
 }
 
-function validateTsConfigPath(path: string) {
-  if (!path.endsWith(".json")) {
+function validateFilePath(filePath: string) {
+  const validExtensions = [".ts", ".tsx", ".js", ".jsx"];
+  const ext = path.extname(filePath);
+
+  if (!validExtensions.includes(ext)) {
     return {
       success: false,
-      reason: "Please enter a valid tsconfig.json file path.",
+      reason: "Please enter a valid TypeScript/JavaScript file path (.ts, .tsx, .js, .jsx).",
     } as const;
   }
 
-  if (!fs.existsSync(path)) {
+  if (!fs.existsSync(filePath)) {
     return {
       success: false,
       reason: "File not found.",
@@ -135,6 +108,3 @@ function validateTsConfigPath(path: string) {
   return { success: true } as const;
 }
 
-function wait(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
